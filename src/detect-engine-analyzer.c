@@ -2195,3 +2195,44 @@ int FirewallAnalyzer(const DetectEngineCtx *de_ctx)
     SCJbFree(ctx.js);
     return 0;
 }
+
+/* -------------------------------------------------------------------------
+ * Prior_State rule-string serializer (task 7, POC scope)
+ * -------------------------------------------------------------------------
+ *
+ * Contract: see SignatureToRuleString() in detect-engine-analyzer.h.
+ *
+ * The POC implementation short-circuits to the Signature's captured
+ * `sig_str` because (a) the expander already rendered a loadable rule
+ * string, and (b) SigInitHelper stores that exact input via SCStrdup on
+ * the Signature. Byte-identical reproduction of the rule fed to
+ * DetectFirewallRuleAppendNew is precisely what design §Components.7
+ * asks for at POC scope. Phase 2 task 16 widens this to re-materialise
+ * the rule from the post-parse Signature state for full option-keyword
+ * round-trip coverage.
+ */
+int SignatureToRuleString(const Signature *s, char *buf, size_t len)
+{
+    if (s == NULL || buf == NULL || len == 0) {
+        return -1;
+    }
+    if (s->sig_str == NULL) {
+        /* Defensive: every Signature that comes through SigInitHelper has
+         * sig_str populated. If a caller somehow reaches us with a
+         * Signature whose source string was never captured (unit-test
+         * harnesses that synthesise Signatures directly, for example),
+         * emit a minimally valid fallback so the caller's buffer is still
+         * NUL-terminated. */
+        int n = snprintf(buf, len, "# <no sig_str captured for sid %" PRIu32 ">", s->id);
+        if (n < 0 || (size_t)n >= len) {
+            return -1;
+        }
+        return n;
+    }
+    const size_t slen = strlen(s->sig_str);
+    if (slen + 1 > len) {
+        return -1;
+    }
+    memcpy(buf, s->sig_str, slen + 1);
+    return (int)slen;
+}

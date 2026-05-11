@@ -413,6 +413,12 @@ noinst_HEADERS = \
 	packet-queue.h \
 	packet.h \
 	pkt-var.h \
+	prior-state-classify.h \
+	prior-state-dump-attribution.h \
+	prior-state-expand.h \
+	prior-state-parse.h \
+	prior-state-registry.h \
+	prior-state-validate.h \
 	queue.h \
 	reputation.h \
 	respond-reject-libnet11.h \
@@ -1011,6 +1017,12 @@ libsuricata_c_a_SOURCES = \
 	packet-queue.c \
 	packet.c \
 	pkt-var.c \
+	prior-state-classify.c \
+	prior-state-dump-attribution.c \
+	prior-state-expand.c \
+	prior-state-parse.c \
+	prior-state-registry.c \
+	prior-state-validate.c \
 	reputation.c \
 	respond-reject-libnet11.c \
 	respond-reject.c \

@@ -44,6 +44,12 @@
 #include "util-threshold-config.h"
 #include "util-path.h"
 
+#include "prior-state-classify.h"
+#include "prior-state-parse.h"
+#include "prior-state-validate.h"
+#include "prior-state-expand.h"
+#include "prior-state-dump-attribution.h"
+
 #include "rust.h"
 
 #ifdef HAVE_GLOB_H
@@ -106,6 +112,179 @@ static char *DetectLoadCompleteSigPathWithKey(
 char *DetectLoadCompleteSigPath(const DetectEngineCtx *de_ctx, const char *sig_file)
 {
     return DetectLoadCompleteSigPathWithKey(de_ctx, "default-rule-path", sig_file);
+}
+
+/**
+ *  \brief Drive the Prior_State pipeline for a single firewall-mode rule line.
+ *
+ *  Runs the classifier (already run by the caller; passed in via \p form),
+ *  the parser, the validator, and the expander, then feeds each expanded
+ *  rule string through the existing DetectFirewallRuleAppendNew path.
+ *
+ *  POC scope (Phase 1, tasks.md task 6): only PRIOR_STATE_OPERATOR lines
+ *  are fully handled. PRIOR_STATE_KEYWORD and PRIOR_STATE_BOTH are not
+ *  produced by the POC classifier today, but this helper rejects them
+ *  defensively with a "not yet supported" error so any future classifier
+ *  change does not silently regress behaviour. The legacy PRIOR_STATE_NONE
+ *  path does not reach this helper — callers fall through to the existing
+ *  DetectFirewallRuleAppendNew call instead.
+ *
+ *  Error semantics mirror the existing loader: on any failure we emit
+ *  the same stderr message shape, append to de_ctx->sig_stat, and return
+ *  non-zero so the caller increments the bad-sig counter and the rule
+ *  load ultimately fails (LoadFirewallRuleFiles treats bad_sigs != 0 as
+ *  exit(EXIT_FAILURE), which preserves Req 8.5).
+ *
+ *  On success all expanded rules were successfully appended; the caller
+ *  increments the good-sig counter by \p *good_out.
+ *
+ *  \param de_ctx   The detection-engine context, used for the per-file
+ *                  rule_file / rule_line bookkeeping DetectFirewallRuleAppendNew
+ *                  reads for its own error reporting.
+ *  \param line     NUL-terminated rule-file line.
+ *  \param sig_file Source filename (for structured error messages).
+ *  \param lineno   Source line number (for structured error messages).
+ *  \param form     Result of PriorStateClassifyLine on \p line.
+ *  \param good_out On success, receives the number of expanded rules that
+ *                  were appended (always >= 1 when return is 0).
+ *
+ *  \retval 0  on success — \p *good_out rules appended.
+ *  \retval -1 on failure — the caller should count one bad sig and
+ *             continue to the next line (the message has already been
+ *             logged via SCLogError).
+ */
+static int DetectPriorStateProcessLine(DetectEngineCtx *de_ctx, const char *line,
+        const char *sig_file, int lineno, PriorStateForm form, int *good_out)
+{
+    *good_out = 0;
+
+    if (form == PRIOR_STATE_KEYWORD || form == PRIOR_STATE_BOTH) {
+        /* POC scope: the classifier never returns these two values today,
+         * so reaching this branch means either the classifier has been
+         * extended without extending this helper, or a caller synthesised
+         * an unexpected form. Fail loudly rather than silently fall
+         * through to an unsupported surface. */
+        SCLogError("fw: %s:%d: accept-prior-states keyword form is not yet "
+                   "supported in the POC; rule rejected",
+                sig_file, lineno);
+        if (!SigStringAppend(&de_ctx->sig_stat, sig_file, line,
+                    "accept-prior-states keyword form not yet supported", lineno)) {
+            SCLogError("Error adding sig \"%s\" from file %s at line %d", line, sig_file, lineno);
+        }
+        return -1;
+    }
+
+    /* Parse. */
+    PriorStateRule rule;
+    memset(&rule, 0, sizeof(rule));
+    char errbuf[512];
+    errbuf[0] = '\0';
+
+    if (PriorStateParseRule(line, sig_file, lineno, &rule, errbuf, sizeof(errbuf)) < 0) {
+        SCLogError("fw: %s:%d: failed to parse prior-state rule: %s", sig_file, lineno,
+                errbuf[0] ? errbuf : "unknown parse error");
+        if (!SigStringAppend(&de_ctx->sig_stat, sig_file, line,
+                    errbuf[0] ? errbuf : "prior-state parse error", lineno)) {
+            SCLogError("Error adding sig \"%s\" from file %s at line %d", line, sig_file, lineno);
+        }
+        return -1;
+    }
+
+    /* Validate. The validator itself emits the structured
+     *   fw: <file>:<lineno>: sid:<parent_sid>: <PSV_*>: <detail>
+     * message via SCLogError; we only need to record the bad sig in the
+     * loader stats so the rule-load semantics match the legacy path. */
+    errbuf[0] = '\0';
+    PriorStateValidationResult vres = PriorStateValidate(&rule, errbuf, sizeof(errbuf));
+    if (vres != PSV_OK) {
+        if (!SigStringAppend(&de_ctx->sig_stat, sig_file, line,
+                    errbuf[0] ? errbuf : PriorStateValidationResultName(vres), lineno)) {
+            SCLogError("Error adding sig \"%s\" from file %s at line %d", line, sig_file, lineno);
+        }
+        PriorStateRuleClean(&rule);
+        return -1;
+    }
+
+    /* Expand. */
+    ExpandedRuleList *expanded = NULL;
+    errbuf[0] = '\0';
+    int erc = PriorStateExpand(&rule, &expanded, errbuf, sizeof(errbuf));
+    if (erc != PRIOR_STATE_EXPAND_OK || expanded == NULL) {
+        SCLogError("fw: %s:%d: sid:%u: prior-state expansion failed: %s", sig_file, lineno,
+                rule.sid, errbuf[0] ? errbuf : "unknown expansion error");
+        if (!SigStringAppend(&de_ctx->sig_stat, sig_file, line,
+                    errbuf[0] ? errbuf : "prior-state expansion failed", lineno)) {
+            SCLogError("Error adding sig \"%s\" from file %s at line %d", line, sig_file, lineno);
+        }
+        ExpandedRuleListFree(expanded);
+        PriorStateRuleClean(&rule);
+        return -1;
+    }
+
+    /* Append each expanded rule through the existing firewall loader path.
+     * The rule_file / rule_line fields on de_ctx are already set by the
+     * caller to the source line's location; every expanded rule is
+     * attributed to that same source line (per design §Components.8). */
+    int appended = 0;
+    for (int i = 0; i < expanded->count; i++) {
+        const char *expanded_rule = expanded->strings[i];
+        if (expanded_rule == NULL)
+            continue;
+
+        Signature *sig = DetectFirewallRuleAppendNew(de_ctx, expanded_rule);
+        if (sig == NULL) {
+            if (!de_ctx->sigerror_silent) {
+                SCLogError("fw: %s:%d: sid:%u: failed to append expanded rule %d/%d: \"%s\"",
+                        sig_file, lineno, rule.sid, i + 1, expanded->count, expanded_rule);
+                if (!SigStringAppend(&de_ctx->sig_stat, sig_file, expanded_rule,
+                            de_ctx->sigerror ? de_ctx->sigerror
+                                             : "expanded rule failed to parse",
+                            lineno)) {
+                    SCLogError("Error adding sig \"%s\" from file %s at line %d", expanded_rule,
+                            sig_file, lineno);
+                }
+                if (de_ctx->sigerror) {
+                    de_ctx->sigerror = NULL;
+                }
+            }
+            ExpandedRuleListFree(expanded);
+            PriorStateRuleClean(&rule);
+            return -1;
+        }
+
+        SCLogDebug("fw: expanded rule %d/%d (parent sid:%u sub:%u) loaded as sid:%u", i + 1,
+                expanded->count, rule.sid, (unsigned)expanded->sub_indexes[i], sig->id);
+
+        /* Surface the `(parent_sid, sub_index, label)` scratch attribution
+         * tuple produced by task 5's expander through to the
+         * --dump-expanded-rules run mode. In normal (non-dump) loads
+         * PriorStateDumpAttributionIsEnabled() returns false and the
+         * record call becomes a no-op, so the hot path is unaffected.
+         * The persistent SidProvenanceTable that makes Sub_SIDs
+         * observable at runtime for eve attribution lands in task 14. */
+        if (PriorStateDumpAttributionIsEnabled()) {
+            const uint16_t sub_index = expanded->sub_indexes[i];
+            const char *label = (expanded->labels != NULL) ? expanded->labels[i] : "";
+            char decision_hook_buf[sizeof(rule.proto) + 1 + sizeof(rule.state)];
+            const char *decision_hook = NULL;
+            if (sub_index == 0) {
+                /* "<proto>:<state>" for the Decision_Hook. */
+                (void)snprintf(decision_hook_buf, sizeof(decision_hook_buf), "%s:%s", rule.proto,
+                        rule.state);
+                decision_hook = decision_hook_buf;
+            }
+            PriorStateDumpAttributionRecord(sig->id, rule.sid, sub_index, label, decision_hook,
+                    sig_file, lineno);
+        }
+
+        appended++;
+    }
+
+    ExpandedRuleListFree(expanded);
+    PriorStateRuleClean(&rule);
+
+    *good_out = appended;
+    return 0;
 }
 
 /**
@@ -175,6 +354,31 @@ static int DetectLoadSigFile(DetectEngineCtx *de_ctx, const char *sig_file, int 
 
         de_ctx->rule_file = sig_file;
         de_ctx->rule_line = lineno - multiline;
+
+        /* Firewall-mode lines may carry the Prior_State "accept-prior-states"
+         * syntactic sugar introduced by this feature. Classify the line
+         * cheaply; PRIOR_STATE_NONE falls through to the existing loader
+         * path, and the legacy non-firewall path is never touched. */
+        if (firewall_rule) {
+            PriorStateForm ps_form = PriorStateClassifyLine(line);
+            if (ps_form != PRIOR_STATE_NONE) {
+                int ps_good = 0;
+                int rc = DetectPriorStateProcessLine(
+                        de_ctx, line, sig_file, lineno - multiline, ps_form, &ps_good);
+                if (rc == 0) {
+                    good += ps_good;
+                } else {
+                    if (!de_ctx->sigerror_ok) {
+                        bad++;
+                    }
+                    if (de_ctx->sigerror) {
+                        de_ctx->sigerror = NULL;
+                    }
+                }
+                multiline = 0;
+                continue;
+            }
+        }
 
         Signature *sig = NULL;
         if (firewall_rule)

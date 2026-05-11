@@ -61,7 +61,6 @@
 #include "datasets.h"
 
 #include "feature.h"
-
 #include "flow-bypass.h"
 #include "flow-manager.h"
 #include "flow-timeout.h"
@@ -144,6 +143,9 @@
 #ifdef SYSTEMD_NOTIFY
 #include "util-systemd.h"
 #endif
+
+#include "detect-engine-analyzer.h"
+#include "prior-state-dump-attribution.h"
 
 #ifdef WINDIVERT
 #include "decode-sll.h"
@@ -729,6 +731,9 @@ static void PrintUsage(const char *progname)
            "'frame' keyword\n");
     printf("\t--dump-config                        : show the running configuration\n");
     printf("\t--dump-features                      : display provided features\n");
+    printf("\t--dump-expanded-rules                : load firewall rule file(s), print the\n"
+           "\t                                       Expanded_Rule set produced by the\n"
+           "\t                                       accept-prior-states pipeline, and exit\n");
     printf("\t--build-info                         : display build information\n");
 
     printf("\n  Testing:\n");
@@ -1385,6 +1390,7 @@ TmEcode SCParseCommandLine(int argc, char **argv)
 
     int dump_config = 0;
     int dump_features = 0;
+    int dump_expanded_rules = 0;
     int list_app_layer_protocols = 0;
     int list_app_layer_hooks = 0;
     int list_app_layer_frames = 0;
@@ -1408,6 +1414,7 @@ TmEcode SCParseCommandLine(int argc, char **argv)
         {"help", 0, 0, 0},
         {"dump-config", 0, &dump_config, 1},
         {"dump-features", 0, &dump_features, 1},
+        {"dump-expanded-rules", 0, &dump_expanded_rules, 1},
         {"pfring", optional_argument, 0, 0},
         {"pfring-int", required_argument, 0, 0},
         {"pfring-cluster-id", required_argument, 0, 0},
@@ -2147,6 +2154,16 @@ TmEcode SCParseCommandLine(int argc, char **argv)
         suri->run_mode = RUNMODE_DUMP_CONFIG;
     if (dump_features)
         suri->run_mode = RUNMODE_DUMP_FEATURES;
+    if (dump_expanded_rules) {
+        suri->run_mode = RUNMODE_DUMP_EXPANDED_RULES;
+        /* Dumping the expanded rule set is a firewall-mode feature: the
+         * expansion pipeline only runs when LoadFirewallRuleFiles is
+         * active on the rule file. Auto-enable firewall mode so users
+         * can reach the dump from either `-S file` or
+         * `--firewall-rules-exclusive file` without having to pass
+         * --firewall too. */
+        suri->is_firewall = true;
+    }
     if (conf_test)
         suri->run_mode = RUNMODE_CONF_TEST;
     if (engine_analysis)
@@ -2527,6 +2544,162 @@ static int LoadSignatures(DetectEngineCtx *de_ctx, SCInstance *suri)
 
     return TM_ECODE_OK;
 }
+
+/**
+ *  \brief  Handler for `--dump-expanded-rules`: walk the loaded signature
+ *          list in load order, reconstruct each rule string via
+ *          SignatureToRuleString(), and emit the Parent_SID/Sub_SID
+ *          attribution comment from design §Components.8 above each
+ *          Prior_State_Rule-derived entry.
+ *
+ *  The attribution table the dump walker consumes is populated by
+ *  DetectPriorStateProcessLine during the rule-load pass (see
+ *  PriorStateDumpAttributionRecord). Non-Prior_State_Rule signatures
+ *  (hand-written state-based rules, packet-filter rules, etc.) have no
+ *  attribution record; the walker emits those as bare rule lines, which
+ *  mirrors the design's behaviour for mixed files.
+ *
+ *  \retval TM_ECODE_OK on a clean dump.
+ *  \retval TM_ECODE_FAILED if no detection engine is available. Classifier
+ *          / parser / validator errors are already reported through the
+ *          existing rule-load error path during SigLoadSignatures; this
+ *          helper never sees them because LoadFirewallRuleFiles exits on
+ *          bad_sigs != 0. Exit status in main() therefore matches a
+ *          normal rule load (Req 9.4).
+ */
+static TmEcode DumpExpandedRulesRunMode(void)
+{
+    DetectEngineCtx *de_ctx = DetectEngineGetCurrent();
+    if (de_ctx == NULL) {
+        SCLogError("fw: --dump-expanded-rules: no detection engine context available");
+        return TM_ECODE_FAILED;
+    }
+
+    /* The rule-load pass above has already produced the full signature
+     * list and populated the scratch attribution table. Two complications
+     * shape this walker:
+     *
+     *   - SCSigOrderSignatures reshuffles de_ctx->sig_list by priority
+     *     after every signature is loaded. To emit rules in the order
+     *     the expander produced them (matching the worked-examples in
+     *     design §Worked Example), we index by the load_seq the
+     *     attribution table records as each expanded rule is appended.
+     *     Hand-written state-based firewall rules have no attribution
+     *     record; their load_seq is 0, which sorts them to the front
+     *     (stable) and is fine for the POC scope because the POC
+     *     fixtures contain only Prior_State_Rules.
+     *
+     *   - Bidirectional (`<>`) rules produce two internal Signatures
+     *     with the same SID (SigInitDo + SIG_FLAG_INIT_BIDIREC). The
+     *     expander emits one rule line, not two, so we deduplicate by
+     *     (runtime_sid, sig_str) — the first one we see wins.
+     */
+    size_t sig_count = 0;
+    for (Signature *s = de_ctx->sig_list; s != NULL; s = s->next) {
+        sig_count++;
+    }
+
+    if (sig_count == 0) {
+        SCLogNotice("fw: --dump-expanded-rules: no rules loaded");
+        DetectEngineDeReference(&de_ctx);
+        return TM_ECODE_OK;
+    }
+
+    /* Build an array we can sort by (load_seq ASC, sid ASC) so the dump
+     * output matches emission order independent of any prioritisation
+     * re-ordering the engine has done. */
+    typedef struct DumpEntry_ {
+        Signature *sig;
+        uint32_t load_seq; /**< 0 when no attribution record */
+    } DumpEntry;
+
+    DumpEntry *arr = SCCalloc(sig_count, sizeof(DumpEntry));
+    if (arr == NULL) {
+        SCLogError("fw: --dump-expanded-rules: out of memory allocating dump array");
+        DetectEngineDeReference(&de_ctx);
+        return TM_ECODE_FAILED;
+    }
+    size_t n = 0;
+    for (Signature *s = de_ctx->sig_list; s != NULL; s = s->next) {
+        const PriorStateDumpAttribution *attr = PriorStateDumpAttributionLookup(s->id);
+        arr[n].sig = s;
+        arr[n].load_seq = (attr != NULL) ? attr->load_seq : 0;
+        n++;
+    }
+
+    /* Simple insertion sort — dump mode only ever handles a handful of
+     * rules (the POC fixtures are 12 and 6 rules respectively; even at
+     * Phase 3 scale this is thousands, not millions). Stable ordering
+     * keeps hand-written rules in their original list position relative
+     * to each other. */
+    for (size_t i = 1; i < n; i++) {
+        DumpEntry tmp = arr[i];
+        size_t j = i;
+        while (j > 0 && arr[j - 1].load_seq > tmp.load_seq) {
+            arr[j] = arr[j - 1];
+            j--;
+        }
+        arr[j] = tmp;
+    }
+
+    /* Walk in load order, deduplicating bidir twins. */
+    uint32_t prev_sid = 0;
+    const char *prev_str = NULL;
+    for (size_t i = 0; i < n; i++) {
+        Signature *s = arr[i].sig;
+        /* Skip duplicate sig_str+sid pair — this collapses the two
+         * internal Signatures emitted for a `<>` bidirectional rule. */
+        if (prev_str != NULL && s->id == prev_sid && s->sig_str != NULL &&
+                strcmp(s->sig_str, prev_str) == 0) {
+            continue;
+        }
+        prev_sid = s->id;
+        prev_str = s->sig_str;
+
+        const PriorStateDumpAttribution *attr = PriorStateDumpAttributionLookup(s->id);
+        if (attr != NULL) {
+            if (attr->is_decision_hook) {
+                /* Decision_Hook attribution comment shape:
+                 *   # sid N (parent), from <proto:state at file:lineno
+                 */
+                printf("# sid %" PRIu32 " (parent), from <%s at %s:%d\n", s->id,
+                        attr->decision_hook != NULL ? attr->decision_hook : "?",
+                        attr->src_file != NULL ? attr->src_file : "?",
+                        attr->src_lineno);
+            } else {
+                /* Auto-accepted attribution comment shape:
+                 *   # sid N (sub PARENT.K: <label>), auto-accepted, from file:lineno
+                 */
+                printf("# sid %" PRIu32 " (sub %" PRIu32 ".%" PRIu16 ": %s), auto-accepted, "
+                       "from %s:%d\n",
+                        s->id, attr->parent_sid, attr->sub_index,
+                        (attr->label != NULL && attr->label[0] != '\0') ? attr->label
+                                                                        : "<unlabeled>",
+                        attr->src_file != NULL ? attr->src_file : "?",
+                        attr->src_lineno);
+            }
+        }
+
+        /* Render the rule itself. Use a generous buffer — DETECT_MAX_RULE_SIZE
+         * is the cap enforced by the loader. */
+        char rule_buf[DETECT_MAX_RULE_SIZE];
+        int rc = SignatureToRuleString(s, rule_buf, sizeof(rule_buf));
+        if (rc < 0) {
+            /* Fall back to an explicit placeholder so the output remains
+             * aligned with the attribution comment; the unit tests and
+             * golden files in task 7.1 / 8.3 catch this shape. */
+            printf("# <rule string unavailable for sid %" PRIu32 ">\n", s->id);
+        } else {
+            printf("%s\n", rule_buf);
+        }
+    }
+
+    fflush(stdout);
+    SCFree(arr);
+    DetectEngineDeReference(&de_ctx);
+    return TM_ECODE_OK;
+}
+
 
 static int ConfigGetCaptureValue(SCInstance *suri)
 {
@@ -3043,6 +3216,15 @@ void SuricataInit(void)
         exit(EXIT_SUCCESS);
     }
 
+    /* When running `--dump-expanded-rules`, enable the scratch
+     * attribution table before rule load so DetectPriorStateProcessLine
+     * can thread the (parent_sid, sub_index, label) tuples produced by
+     * the task 5 expander through to the dump walker. Non-dump loads
+     * leave the flag off and the record helper is a no-op. */
+    if (suricata.run_mode == RUNMODE_DUMP_EXPANDED_RULES) {
+        PriorStateDumpAttributionEnable();
+    }
+
     int tracking = 1;
     if (SCConfGetBool("vlan.use-for-tracking", &tracking) == 1 && !tracking) {
         /* Ignore vlan_ids when comparing flows. */
@@ -3102,6 +3284,23 @@ void SuricataInit(void)
         goto out;
     } else if (suricata.run_mode == RUNMODE_DUMP_FEATURES) {
         FeatureDump();
+        goto out;
+    } else if (suricata.run_mode == RUNMODE_DUMP_EXPANDED_RULES) {
+        /* The full classifier → parser → validator → expander → existing
+         * loader pipeline has already run inside PostConfLoadedDetectSetup
+         * via LoadFirewallRuleFiles. Classifier / parser / validator
+         * errors route through the same bad-sig accounting the normal
+         * load uses, so a rejection during load already exited non-zero
+         * (Req 9.4). At this point all surviving rules are in
+         * de_ctx->sig_list; walk them and emit each via
+         * SignatureToRuleString with its attribution comment. No packet
+         * capture or detection threads are started. */
+        TmEcode drc = DumpExpandedRulesRunMode();
+        PriorStateDumpAttributionDisable();
+        if (drc != TM_ECODE_OK) {
+            GlobalsDestroy();
+            exit(EXIT_FAILURE);
+        }
         goto out;
     }
 

@@ -61,6 +61,7 @@ typedef enum SCRunModes {
     RUNMODE_CHANGE_SERVICE_PARAMS,
 #endif
     RUNMODE_DUMP_FEATURES,
+    RUNMODE_DUMP_EXPANDED_RULES, /**< firewall prior-state expansion dump */
     RUNMODE_MAX,
 } SCRunMode;
 

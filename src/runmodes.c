@@ -551,6 +551,7 @@ bool IsRunModeSystem(enum SCRunModes run_mode_to_check)
         case RUNMODE_PCAP_FILE:
         case RUNMODE_ERF_FILE:
         case RUNMODE_ENGINE_ANALYSIS:
+        case RUNMODE_DUMP_EXPANDED_RULES:
             return false;
             break;
         default:
@@ -565,6 +566,7 @@ bool IsRunModeOffline(enum SCRunModes run_mode_to_check)
         case RUNMODE_PCAP_FILE:
         case RUNMODE_ERF_FILE:
         case RUNMODE_ENGINE_ANALYSIS:
+        case RUNMODE_DUMP_EXPANDED_RULES:
         case RUNMODE_UNIX_SOCKET:
             return true;
             break;
