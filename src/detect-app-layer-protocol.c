@@ -423,17 +423,13 @@ static bool DetectAppLayerProtocolsConflict(
     if (us->mode != them->mode)
         return false;
 
-    /* Both negated under the same mode: only a conflict when the value sets
-     * intersect. Identical or overlapping negated lists are redundant, while
-     * disjoint negated lists (e.g. !http; !dns;) are a valid NOR combination. */
+    /* Both negated under the same mode: never a conflict. Multiple negated
+     * SigMatches compose as AND-of-NOR at match time and produce the correct
+     * match set regardless of whether the value sets are identical, partially
+     * overlapping, or disjoint — umbrella-alias collisions (e.g. !http and
+     * !http2 both expand to {http, http1, http2}) included. Redundancy is
+     * authoring feedback, not a load-time error. */
     if (us->negated && them->negated) {
-        for (AppProto a = 0; a < g_alproto_max; a++) {
-            if (AlprotoBitmaskTest(us->alprotos, a) && AlprotoBitmaskTest(them->alprotos, a)) {
-                SCLogError("conflicting app-layer-protocol rules: "
-                           "duplicate or overlapping negated entries under the same mode");
-                return true;
-            }
-        }
         return false;
     }
 
